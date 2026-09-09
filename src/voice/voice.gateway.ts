@@ -76,6 +76,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client: Socket,
     payload: { to: string; sdp: any },
   ): Promise<void> {
+    this.voiceService.recordSignal('offer');
     this.server.to(payload.to).emit(SOCKET_EVENTS.VOICE_OFFER, {
       from: client.id,
       sdp: payload.sdp,
@@ -91,6 +92,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client: Socket,
     payload: { to: string; sdp: any },
   ): Promise<void> {
+    this.voiceService.recordSignal('answer');
     this.server.to(payload.to).emit(SOCKET_EVENTS.VOICE_ANSWER, {
       from: client.id,
       sdp: payload.sdp,
@@ -106,10 +108,20 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client: Socket,
     payload: { to: string; candidate: any },
   ): Promise<void> {
+    this.voiceService.recordSignal('ice');
     this.server.to(payload.to).emit(SOCKET_EVENTS.VOICE_ICE_CANDIDATE, {
       from: client.id,
       candidate: payload.candidate,
     });
+  }
+
+  /**
+   * Voice signaling server health check query.
+   */
+  @SubscribeMessage('voice:health')
+  async handleHealthCheck(client: Socket): Promise<void> {
+    const health = this.voiceService.getHealthStatus();
+    client.emit('voice:health', health);
   }
 
   /**
@@ -128,3 +140,4 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       .emit('voice:peer-left', { peerId: client.id });
   }
 }
+

@@ -19,7 +19,8 @@ export interface Player {
 export interface Token {
   id: number;
   state: TokenState;
-  position: number; // -1 = home, 0-51 = board, 52+ = finish path
+  position: number; // -1 = home, 0-51 = board, 52-56 = home column, 57 = goal
+  stepCount?: number; // steps traveled: 0 in home, 1 at start, up to 57 at goal
 }
 
 /** A dice roll result */
@@ -39,6 +40,8 @@ export interface Match {
   startedAt: number | null;
   finishedAt: number | null;
   winner: PlayerColor | null;
+  currentDiceRoll?: DiceRoll | null;
+  hasRolled?: boolean;
 }
 
 /** Matchmaking queue entry */
@@ -47,15 +50,20 @@ export interface MatchmakingEntry {
   walletAddress: string;
   stake: number; // XLM amount
   joinedAt: number;
+  elo?: number; // Skill rating (default 1200)
 }
 
 /** Session key payload */
 export interface SessionKeyPayload {
   sessionKey: string;
+  sessionPublicKey?: string;
+  sessionSecret?: string;
   walletAddress: string;
   matchId: string;
   expiresAt: number;
+  authorized?: boolean;
 }
+
 
 /** Transaction queue job data */
 export interface TransactionJobData {

@@ -6,9 +6,10 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { Logger } from '@nestjs/common';
+import { Logger, Optional } from '@nestjs/common';
 import { MatchService } from './match.service';
 import { MatchmakingService } from './matchmaking.service';
+import { AuthService } from '../auth/auth.service';
 import { SOCKET_EVENTS } from '../common/constants';
 import { MatchmakingEntry } from '../common/interfaces';
 
@@ -34,6 +35,8 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private readonly matchService: MatchService,
     private readonly matchmakingService: MatchmakingService,
+    @Optional()
+    private readonly authService?: AuthService,
   ) {}
 
   async handleConnection(client: Socket): Promise<void> {
@@ -46,7 +49,6 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const entry = this.socketMap.get(client.id);
 
     if (entry?.matchId) {
-      // Notify match of disconnect
       const match = this.matchmakingService.getMatch(entry.matchId);
       if (match) {
         const player = match.players.find((p) => p.userId === entry.userId);
@@ -63,26 +65,36 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Join the global matchmaking queue.
-   * Payload: { walletAddress }
+   * Join the global matchmaking queue with Elo rating.
+   * Payload: { walletAddress, elo?: number, stake?: number }
    */
   @SubscribeMessage('matchmaking:join')
   async handleJoinQueue(
     client: Socket,
-    payload: { walletAddress: string },
+    payload: { walletAddress: string; elo?: number; stake?: number },
   ): Promise<void> {
     try {
       const entry: MatchmakingEntry = {
         userId: client.id,
         walletAddress: payload.walletAddress,
-        stake: 0.2,
+        stake: payload.stake ?? 0.2,
         joinedAt: Date.now(),
+        elo: payload.elo ?? 1200,
       };
 
-      await this.matchmakingService.addToQueue(entry);
-      client.emit('matchmaking:queued', {
-        position: this.matchmakingService.getQueueSize(),
-      });
+      const match = await this.matchmakingService.addToQueue(entry);
+
+      if (match) {
+        client.join(match.id);
+        const mapEntry = this.socketMap.get(client.id);
+        if (mapEntry) mapEntry.matchId = match.id;
+
+        this.server.to(match.id).emit(SOCKET_EVENTS.MATCH_STARTED, { match });
+      } else {
+        client.emit('matchmaking:queued', {
+          position: this.matchmakingService.getQueueSize(),
+        });
+      }
     } catch (error) {
       this.logger.error(`Matchmaking error: ${(error as Error).message}`);
       client.emit(SOCKET_EVENTS.ERROR, { message: 'Failed to join queue' });
@@ -131,15 +143,39 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Roll the dice.
-   * Payload: { matchId, playerColor }
+   * Roll the dice, optionally verified with ephemeral session key signature.
+   * Payload: { matchId, playerColor, sessionPublicKey?, signature? }
    */
   @SubscribeMessage('game:roll')
   async handleRollDice(
     client: Socket,
-    payload: { matchId: string; playerColor: string },
+    payload: {
+      matchId: string;
+      playerColor: string;
+      sessionPublicKey?: string;
+      signature?: string;
+    },
   ): Promise<void> {
     try {
+      // If session key is provided, verify signature
+      if (payload.sessionPublicKey && payload.signature && this.authService) {
+        const verifyData = {
+          action: 'roll',
+          matchId: payload.matchId,
+          playerColor: payload.playerColor,
+        };
+        const isValidSession = await this.authService.verifySessionSignature(
+          payload.sessionPublicKey,
+          payload.matchId,
+          verifyData,
+          payload.signature,
+        );
+        if (!isValidSession) {
+          client.emit(SOCKET_EVENTS.ERROR, { message: 'Invalid session signature' });
+          return;
+        }
+      }
+
       const result = this.matchService.handleRollDice(
         payload.matchId,
         payload.playerColor,
@@ -155,6 +191,14 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
         playerColor: payload.playerColor,
         diceRoll: result.diceRoll,
       });
+
+      // If roll had no valid moves, broadcast auto-advanced turn change
+      if (result.autoTurnAdvanced) {
+        this.server.to(payload.matchId).emit(SOCKET_EVENTS.TURN_CHANGED, {
+          currentTurn: result.match.players[result.match.currentTurnIndex].color,
+          turnDeadline: result.match.turnDeadline,
+        });
+      }
     } catch (error) {
       this.logger.error(`Roll dice error: ${(error as Error).message}`);
       client.emit(SOCKET_EVENTS.ERROR, { message: 'Failed to roll dice' });
@@ -162,15 +206,41 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
-   * Move a token.
-   * Payload: { matchId, playerColor, tokenId }
+   * Move a token, optionally verified with ephemeral session key signature.
+   * Payload: { matchId, playerColor, tokenId, sessionPublicKey?, signature? }
    */
   @SubscribeMessage('game:move')
   async handleMoveToken(
     client: Socket,
-    payload: { matchId: string; playerColor: string; tokenId: number },
+    payload: {
+      matchId: string;
+      playerColor: string;
+      tokenId: number;
+      sessionPublicKey?: string;
+      signature?: string;
+    },
   ): Promise<void> {
     try {
+      // If session key is provided, verify signature without wallet popup
+      if (payload.sessionPublicKey && payload.signature && this.authService) {
+        const verifyData = {
+          action: 'move',
+          matchId: payload.matchId,
+          playerColor: payload.playerColor,
+          tokenId: payload.tokenId,
+        };
+        const isValidSession = await this.authService.verifySessionSignature(
+          payload.sessionPublicKey,
+          payload.matchId,
+          verifyData,
+          payload.signature,
+        );
+        if (!isValidSession) {
+          client.emit(SOCKET_EVENTS.ERROR, { message: 'Invalid session signature' });
+          return;
+        }
+      }
+
       const result = await this.matchService.handleMoveToken(
         payload.matchId,
         payload.playerColor,
@@ -203,13 +273,13 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
           winner: payload.playerColor,
           match: result.match,
         });
+      } else {
+        // Broadcast turn change
+        this.server.to(payload.matchId).emit(SOCKET_EVENTS.TURN_CHANGED, {
+          currentTurn: result.match.players[result.match.currentTurnIndex].color,
+          turnDeadline: result.match.turnDeadline,
+        });
       }
-
-      // Broadcast turn change
-      this.server.to(payload.matchId).emit(SOCKET_EVENTS.TURN_CHANGED, {
-        currentTurn: result.match.players[result.match.currentTurnIndex].color,
-        turnDeadline: result.match.turnDeadline,
-      });
     } catch (error) {
       this.logger.error(`Move token error: ${(error as Error).message}`);
       client.emit(SOCKET_EVENTS.ERROR, { message: 'Failed to move token' });
@@ -272,3 +342,4 @@ export class MatchGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 }
+

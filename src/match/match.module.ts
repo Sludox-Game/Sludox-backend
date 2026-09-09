@@ -6,12 +6,18 @@ import { MatchmakingService } from './matchmaking.service';
 import { LudoEngine } from './ludo-engine.service';
 import { AiPlayerService } from './ai-player.service';
 import { QUEUES } from '../common/constants';
+import { LeaderboardModule } from '../leaderboard/leaderboard.module';
+import { VoiceModule } from '../voice/voice.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
     BullModule.registerQueue({
       name: QUEUES.TRANSACTION,
     }),
+    LeaderboardModule,
+    VoiceModule,
+    AuthModule,
   ],
   providers: [
     MatchGateway,
@@ -23,3 +29,4 @@ import { QUEUES } from '../common/constants';
   exports: [MatchService, MatchmakingService],
 })
 export class MatchModule {}
+

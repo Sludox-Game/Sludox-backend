@@ -63,6 +63,24 @@ export class AuthGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   /**
+   * Request a challenge nonce for wallet authentication.
+   * Payload: { walletAddress }
+   */
+  @SubscribeMessage('auth:challenge')
+  async handleChallenge(
+    client: Socket,
+    payload: { walletAddress: string },
+  ): Promise<void> {
+    try {
+      const challengeData = this.authService.generateChallenge(payload.walletAddress);
+      client.emit('auth:challenge', challengeData);
+    } catch (error) {
+      this.logger.error(`Challenge generation error: ${(error as Error).message}`);
+      client.emit(SOCKET_EVENTS.ERROR, { message: 'Challenge generation failed' });
+    }
+  }
+
+  /**
    * Handle session key generation after wallet auth.
    * Payload: { walletAddress, matchId }
    */
@@ -84,4 +102,68 @@ export class AuthGateway implements OnGatewayConnection, OnGatewayDisconnect {
       });
     }
   }
+
+  /**
+   * Handle delegation of a client-side session key.
+   * Payload: { walletAddress, sessionPublicKey, matchId, walletSignature, delegationMessage }
+   */
+  @SubscribeMessage('auth:delegate-session')
+  async handleDelegateSession(
+    client: Socket,
+    payload: {
+      walletAddress: string;
+      sessionPublicKey: string;
+      matchId: string;
+      walletSignature: string;
+      delegationMessage: string;
+    },
+  ): Promise<void> {
+    try {
+      const success = await this.authService.authorizeSessionKey(
+        payload.walletAddress,
+        payload.sessionPublicKey,
+        payload.matchId,
+        payload.walletSignature,
+        payload.delegationMessage,
+      );
+
+      if (!success) {
+        client.emit(SOCKET_EVENTS.ERROR, { message: 'Session delegation failed' });
+        return;
+      }
+
+      client.emit('auth:session-delegated', {
+        sessionPublicKey: payload.sessionPublicKey,
+        matchId: payload.matchId,
+      });
+    } catch (error) {
+      this.logger.error(`Session delegation error: ${(error as Error).message}`);
+      client.emit(SOCKET_EVENTS.ERROR, { message: 'Delegation failed' });
+    }
+  }
+
+  /**
+   * Verify an active session key.
+   * Payload: { sessionKey, matchId }
+   */
+  @SubscribeMessage('auth:verify-session')
+  async handleVerifySession(
+    client: Socket,
+    payload: { sessionKey: string; matchId: string },
+  ): Promise<void> {
+    try {
+      const isValid = await this.authService.validateSessionKey(
+        payload.sessionKey,
+        payload.matchId,
+      );
+      client.emit('auth:session-verified', {
+        sessionKey: payload.sessionKey,
+        valid: isValid,
+      });
+    } catch (error) {
+      this.logger.error(`Session verify error: ${(error as Error).message}`);
+      client.emit(SOCKET_EVENTS.ERROR, { message: 'Verification failed' });
+    }
+  }
 }
+

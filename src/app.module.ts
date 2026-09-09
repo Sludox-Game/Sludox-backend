@@ -8,13 +8,20 @@ import { AuthModule } from './auth/auth.module';
 import { MatchModule } from './match/match.module';
 import { VoiceModule } from './voice/voice.module';
 import { BlockchainModule } from './blockchain/blockchain.module';
+import { LeaderboardModule } from './leaderboard/leaderboard.module';
+import { envValidationSchema } from './config/env.validation';
 
 @Module({
   imports: [
-    // ── Environment Configuration ──
+    // ── Environment Configuration with Joi Schema Validation (SG-B07) ──
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',
+      validationSchema: envValidationSchema,
+      validationOptions: {
+        allowUnknown: true,
+        abortEarly: false,
+      },
     }),
 
     // ── PostgreSQL (TypeORM) ──
@@ -46,6 +53,8 @@ import { BlockchainModule } from './blockchain/blockchain.module';
     MatchModule,
     VoiceModule,
     BlockchainModule,
+    LeaderboardModule,
   ],
 })
 export class AppModule {}
+

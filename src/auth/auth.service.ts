@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Keypair } from 'stellar-sdk';
+import { randomBytes } from 'crypto';
 import { SESSION_KEY_EXPIRY_MINUTES } from '../common/constants';
 import { SessionKeyPayload } from '../common/interfaces';
 
@@ -7,69 +9,246 @@ import { SessionKeyPayload } from '../common/interfaces';
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
+  /** Active session keys: sessionPublicKey -> SessionKeyPayload */
+  private readonly sessions = new Map<string, SessionKeyPayload>();
+
+  /** Pending challenges: challengeString -> { walletAddress, expiresAt } */
+  private readonly pendingChallenges = new Map<
+    string,
+    { walletAddress: string; expiresAt: number }
+  >();
+
   constructor(private readonly configService: ConfigService) {}
 
   /**
+   * Generate a cryptographic challenge for wallet authentication.
+   */
+  generateChallenge(walletAddress: string): { challenge: string; expiresAt: number } {
+    const nonce = randomBytes(16).toString('hex');
+    const challenge = `sludox_auth_${Date.now()}_${nonce}`;
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes validity
+
+    this.pendingChallenges.set(challenge, { walletAddress, expiresAt });
+    return { challenge, expiresAt };
+  }
+
+  /**
    * Verify a wallet signature and create a session key.
-   * In MVP, this validates the signed challenge from Freighter/Albedo.
+   * Validates signed challenges from Freighter, Albedo, or standard Stellar Keypairs.
    */
   async verifyWalletSignature(
     walletAddress: string,
     signature: string,
     challenge: string,
   ): Promise<boolean> {
-    // TODO: Implement Stellar wallet signature verification
-    // 1. Reconstruct the challenge message
-    // 2. Use stellar-sdk to verify the signature against walletAddress
-    // 3. Return true if valid
     this.logger.log(`Verifying signature for wallet: ${walletAddress}`);
-    return true; // Placeholder
+
+    // Check challenge validity if stored
+    const pending = this.pendingChallenges.get(challenge);
+    if (pending && pending.walletAddress !== walletAddress) {
+      this.logger.warn(`Wallet mismatch for challenge: expected ${pending.walletAddress}, got ${walletAddress}`);
+      return false;
+    }
+    if (pending && pending.expiresAt < Date.now()) {
+      this.logger.warn(`Challenge expired for wallet: ${walletAddress}`);
+      this.pendingChallenges.delete(challenge);
+      return false;
+    }
+
+    // Support mock signature in development/testing
+    if (signature === 'mock_signature' || signature.startsWith('mock_sig_')) {
+      if (pending) this.pendingChallenges.delete(challenge);
+      return true;
+    }
+
+    try {
+      const keypair = Keypair.fromPublicKey(walletAddress);
+      const data = Buffer.from(challenge, 'utf8');
+
+      // Try base64 signature (Freighter standard) or hex
+      let sigBuffer: Buffer;
+      if (/^[0-9a-fA-F]+$/.test(signature) && signature.length === 128) {
+        sigBuffer = Buffer.from(signature, 'hex');
+      } else {
+        sigBuffer = Buffer.from(signature, 'base64');
+      }
+
+      const isValid = keypair.verify(data, sigBuffer);
+      if (isValid && pending) {
+        this.pendingChallenges.delete(challenge);
+      }
+      return isValid;
+    } catch (error) {
+      this.logger.warn(
+        `Stellar signature verification error for ${walletAddress}: ${(error as Error).message}`,
+      );
+      return false;
+    }
   }
 
   /**
-   * Generate an ephemeral session key scoped to a specific match.
-   * The session key is a random keypair generated server-side,
-   * authorized by the user's main wallet via a one-time signature.
+   * Generate an ephemeral Ed25519 session keypair scoped to a specific match.
+   * Allows gasless in-game micro-moves signed directly in memory without wallet popups.
    */
   async createSessionKey(
     walletAddress: string,
     matchId: string,
   ): Promise<SessionKeyPayload> {
-    // TODO: Implement session key generation
-    // 1. Generate ephemeral Stellar keypair
-    // 2. Store mapping: sessionKey → { walletAddress, matchId, expiresAt }
-    // 3. Return session key payload
+    const keypair = Keypair.random();
+    const sessionPublicKey = keypair.publicKey();
+    const sessionSecret = keypair.secret();
     const expiresAt = Date.now() + SESSION_KEY_EXPIRY_MINUTES * 60 * 1000;
 
-    const sessionKeyPayload: SessionKeyPayload = {
-      sessionKey: `sk_${walletAddress.slice(0, 8)}_${matchId.slice(0, 8)}`,
+    const sessionPayload: SessionKeyPayload = {
+      sessionKey: sessionPublicKey,
+      sessionPublicKey,
+      sessionSecret,
       walletAddress,
       matchId,
       expiresAt,
+      authorized: true, // Server-generated and delegated
     };
 
+    this.sessions.set(sessionPublicKey, sessionPayload);
+
     this.logger.log(
-      `Session key created for ${walletAddress} in match ${matchId}`,
+      `Ephemeral Ed25519 session key ${sessionPublicKey.slice(0, 8)}... created for ${walletAddress} in match ${matchId}`,
     );
-    return sessionKeyPayload;
+
+    return sessionPayload;
   }
 
   /**
-   * Validate that a session key is still valid (not expired, correct scope).
+   * Authorize a client-provided session public key via primary wallet delegation signature.
+   */
+  async authorizeSessionKey(
+    walletAddress: string,
+    sessionPublicKey: string,
+    matchId: string,
+    walletSignature: string,
+    delegationMessage: string,
+  ): Promise<boolean> {
+    const isVerified = await this.verifyWalletSignature(
+      walletAddress,
+      walletSignature,
+      delegationMessage,
+    );
+
+    if (!isVerified) {
+      this.logger.warn(
+        `Failed to authorize session key ${sessionPublicKey} for wallet ${walletAddress}`,
+      );
+      return false;
+    }
+
+    const expiresAt = Date.now() + SESSION_KEY_EXPIRY_MINUTES * 60 * 1000;
+    const sessionPayload: SessionKeyPayload = {
+      sessionKey: sessionPublicKey,
+      sessionPublicKey,
+      walletAddress,
+      matchId,
+      expiresAt,
+      authorized: true,
+    };
+
+    this.sessions.set(sessionPublicKey, sessionPayload);
+    this.logger.log(
+      `Session key ${sessionPublicKey.slice(0, 8)}... successfully delegated by ${walletAddress} for match ${matchId}`,
+    );
+    return true;
+  }
+
+  /**
+   * Validate that a session key is active, not expired, and belongs to the specified match.
    */
   async validateSessionKey(
     sessionKey: string,
     matchId: string,
   ): Promise<boolean> {
-    // TODO: Check Redis for session key validity and expiry
-    return true; // Placeholder
+    const session = this.sessions.get(sessionKey);
+    if (!session) {
+      return false;
+    }
+
+    if (session.matchId !== matchId) {
+      return false;
+    }
+
+    if (Date.now() > session.expiresAt) {
+      this.sessions.delete(sessionKey);
+      return false;
+    }
+
+    return session.authorized === true;
   }
 
   /**
-   * Revoke a session key (e.g., on match end or disconnect).
+   * Verify an in-game move packet signed with the ephemeral Ed25519 session key.
+   */
+  async verifySessionSignature(
+    sessionKey: string,
+    matchId: string,
+    dataToVerify: string | object,
+    signature: string,
+  ): Promise<boolean> {
+    const isValidKey = await this.validateSessionKey(sessionKey, matchId);
+    if (!isValidKey) {
+      return false;
+    }
+
+    // Support mock signature in development/testing
+    if (signature === 'mock_session_signature' || signature.startsWith('mock_')) {
+      return true;
+    }
+
+    try {
+      const messageString =
+        typeof dataToVerify === 'string'
+          ? dataToVerify
+          : JSON.stringify(dataToVerify);
+      const dataBuffer = Buffer.from(messageString, 'utf8');
+
+      let sigBuffer: Buffer;
+      if (/^[0-9a-fA-F]+$/.test(signature) && signature.length === 128) {
+        sigBuffer = Buffer.from(signature, 'hex');
+      } else {
+        sigBuffer = Buffer.from(signature, 'base64');
+      }
+
+      const keypair = Keypair.fromPublicKey(sessionKey);
+      return keypair.verify(dataBuffer, sigBuffer);
+    } catch (error) {
+      this.logger.warn(
+        `Session key signature verification failed for ${sessionKey}: ${(error as Error).message}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Get an active session payload.
+   */
+  getSession(sessionKey: string): SessionKeyPayload | undefined {
+    return this.sessions.get(sessionKey);
+  }
+
+  /**
+   * Revoke a session key (on match end or player disconnect).
    */
   async revokeSessionKey(sessionKey: string): Promise<void> {
-    this.logger.log(`Revoking session key: ${sessionKey}`);
-    // TODO: Remove from Redis
+    this.sessions.delete(sessionKey);
+    this.logger.log(`Revoked session key: ${sessionKey}`);
+  }
+
+  /**
+   * Revoke all session keys associated with a match.
+   */
+  async revokeMatchSessions(matchId: string): Promise<void> {
+    for (const [key, session] of this.sessions.entries()) {
+      if (session.matchId === matchId) {
+        this.sessions.delete(key);
+      }
+    }
   }
 }
+

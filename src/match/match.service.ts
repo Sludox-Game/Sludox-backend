@@ -1,39 +1,22 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { Match, Player, DiceRoll } from '../common/interfaces';
-import { MatchStatus, SeatType, TokenState } from '../common/enums';
+import { MatchStatus, SeatType, TokenState, PlayerColor } from '../common/enums';
 import {
   QUEUES,
   TURN_TIMEOUT_SECONDS,
   MAX_TIMEOUT_STRIKES,
   CAPTURE_REWARD_XLM,
+  BASE_BUY_IN_XLM,
+  PLAYERS_PER_MATCH,
+  PLATFORM_RAKE_PERCENT,
 } from '../common/constants';
 import { LudoEngine } from './ludo-engine.service';
 import { AiPlayerService } from './ai-player.service';
 import { MatchmakingService } from './matchmaking.service';
-
-/**
- * On-chain integration notes:
- *
- * 1. Dice rolls should use the Soroban contract's commit-reveal:
- *    - Call `commit_dice_roll(match_id, player, hash(nonce, value))` on the contract
- *    - Call `reveal_dice_roll(match_id, player, nonce, value)` to get the verified result
- *
- * 2. Moves should be validated via the contract before execution:
- *    - Call `validate_move(match_id, player, token_id, dice_value, from_pos, to_pos)`
- *    - The contract enforces: HOME tokens need 6, board moves match dice, no finish overshoot
- *
- * 3. AI failover is handled on-chain:
- *    - Call `report_inactivity(match_id, reporter, inactive_player)` to prove timeout
- *    - After 2 timeout strikes, `is_ai_controlled(match_id, player)` returns true
- *    - Call `execute_ai_move(match_id, ai_player, move_action)` for contract-enforced AI moves
- *
- * 4. Game state is tracked on-chain:
- *    - Call `initialize_game_state(match_id, players, turn_timeout)` after match init
- *    - Call `advance_turn(match_id)` to rotate to next player
- *    - Call `get_game_state(match_id)` to query turn index, deadlines, AI status
- */
+import { LeaderboardService } from '../leaderboard/leaderboard.service';
+import { VoiceService } from '../voice/voice.service';
 
 @Injectable()
 export class MatchService {
@@ -45,6 +28,10 @@ export class MatchService {
     private readonly matchmakingService: MatchmakingService,
     @InjectQueue(QUEUES.TRANSACTION)
     private readonly transactionQueue: Queue,
+    @Optional()
+    private readonly leaderboardService?: LeaderboardService,
+    @Optional()
+    private readonly voiceService?: VoiceService,
   ) {}
 
   /**
@@ -58,6 +45,8 @@ export class MatchService {
     match.startedAt = Date.now();
     match.currentTurnIndex = 0;
     match.turnDeadline = Date.now() + TURN_TIMEOUT_SECONDS * 1000;
+    match.hasRolled = false;
+    match.currentDiceRoll = null;
 
     this.matchmakingService.updateMatch(matchId, match);
     this.logger.log(`Match ${matchId} started`);
@@ -70,19 +59,48 @@ export class MatchService {
   handleRollDice(
     matchId: string,
     playerColor: string,
-  ): { match: Match; diceRoll: DiceRoll } | null {
+  ): { match: Match; diceRoll: DiceRoll; autoTurnAdvanced: boolean } | null {
     const match = this.matchmakingService.getMatch(matchId);
     if (!match || match.status !== MatchStatus.STARTED) return null;
 
     const currentPlayer = match.players[match.currentTurnIndex];
-    if (currentPlayer.color !== playerColor) return null;
+    if (currentPlayer.color !== playerColor) {
+      this.logger.warn(
+        `Roll rejected: current turn is ${currentPlayer.color}, received ${playerColor}`,
+      );
+      return null;
+    }
+
+    if (match.hasRolled) {
+      this.logger.warn(`Roll rejected: player ${playerColor} already rolled this turn`);
+      return null;
+    }
 
     const diceRoll = this.ludoEngine.rollDice();
-    return { match, diceRoll };
+    match.currentDiceRoll = diceRoll;
+    match.hasRolled = true;
+
+    // Check if player has any legal moves available with this dice roll
+    const hasLegalMove = this.ludoEngine.hasAnyValidMove(currentPlayer, diceRoll.value);
+    let autoTurnAdvanced = false;
+
+    if (!hasLegalMove) {
+      this.logger.log(
+        `Player ${playerColor} rolled ${diceRoll.value} with no valid moves. Advancing turn automatically.`,
+      );
+      match.hasRolled = false;
+      match.currentDiceRoll = null;
+      match.currentTurnIndex = this.ludoEngine.getNextTurn(match.currentTurnIndex);
+      match.turnDeadline = Date.now() + TURN_TIMEOUT_SECONDS * 1000;
+      autoTurnAdvanced = true;
+    }
+
+    this.matchmakingService.updateMatch(matchId, match);
+    return { match, diceRoll, autoTurnAdvanced };
   }
 
   /**
-   * Handle a token move from a player.
+   * Handle a token move from a player with server-authoritative validation.
    */
   async handleMoveToken(
     matchId: string,
@@ -96,78 +114,111 @@ export class MatchService {
     const match = this.matchmakingService.getMatch(matchId);
     if (!match || match.status !== MatchStatus.STARTED) return null;
 
-    const player = match.players.find((p) => p.color === playerColor);
-    if (!player) return null;
+    const currentPlayer = match.players[match.currentTurnIndex];
+    if (currentPlayer.color !== playerColor) {
+      this.logger.warn(`Move rejected: not ${playerColor}'s turn`);
+      return null;
+    }
 
-    const token = player.tokens.find((t) => t.id === tokenId);
-    if (!token) return null;
+    if (!match.hasRolled || !match.currentDiceRoll) {
+      this.logger.warn(`Move rejected: player must roll before moving`);
+      return null;
+    }
 
-    // Calculate new position
-    const newPosition = this.ludoEngine.calculateNewPosition(
-      token,
-      1, // TODO: Use actual dice value from state
-      player.color,
+    const diceValue = match.currentDiceRoll.value;
+    const validation = this.ludoEngine.validateMove(
+      match,
+      playerColor as PlayerColor,
+      tokenId,
+      diceValue,
     );
 
-    // Update token position
-    token.position = newPosition;
-    token.state = TokenState.ACTIVE;
+    if (!validation.valid) {
+      this.logger.warn(`Move rejected: ${validation.reason}`);
+      return null;
+    }
 
-    // Check for capture
-    const capturedPlayer = this.ludoEngine.checkCapture(
-      newPosition,
-      player.color,
-      match.players,
+    // Apply move deterministically
+    const moveResult = this.ludoEngine.applyMove(
+      match,
+      playerColor as PlayerColor,
+      tokenId,
+      diceValue,
     );
 
-    if (capturedPlayer) {
-      // Send captured token back home
-      for (const t of capturedPlayer.tokens) {
-        if (t.position === newPosition) {
-          t.state = TokenState.HOME;
-          t.position = -1;
-        }
-      }
+    // Reset turn dice state
+    match.hasRolled = false;
+    match.currentDiceRoll = null;
 
-      // Queue capture payout transaction
+    // Handle capture
+    let capturedPlayer: Player | undefined;
+    if (moveResult.captured) {
+      capturedPlayer = moveResult.captured.player;
+
+      // Queue capture payout transaction in BullMQ
       await this.transactionQueue.add('capture-payout', {
         type: 'capture_payout',
         matchId,
         fromWallet: capturedPlayer.walletAddress,
-        toWallet: player.walletAddress,
+        toWallet: currentPlayer.walletAddress,
         amount: CAPTURE_REWARD_XLM.toString(),
       });
 
+      // Record in Leaderboard service
+      if (this.leaderboardService) {
+        await this.leaderboardService.recordCapture(
+          currentPlayer.walletAddress,
+          CAPTURE_REWARD_XLM,
+        );
+      }
+
       this.logger.log(
-        `Capture! ${player.color} captured ${capturedPlayer.color}'s token`,
+        `Capture! ${currentPlayer.color} captured ${capturedPlayer.color}'s token`,
       );
     }
 
-    // Check for winner
-    const isWinner = this.ludoEngine.checkWinner(player);
-    if (isWinner) {
+    // Handle winner
+    if (moveResult.isWinner) {
       match.status = MatchStatus.FINISHED;
       match.finishedAt = Date.now();
-      match.winner = player.color;
+      match.winner = playerColor as PlayerColor;
+
+      const totalBuyIns = BASE_BUY_IN_XLM * PLAYERS_PER_MATCH;
+      const rake = totalBuyIns * (PLATFORM_RAKE_PERCENT / 100);
+      const winnerPrize = totalBuyIns - rake;
 
       // Queue winner payout
       await this.transactionQueue.add('winner-payout', {
         type: 'winner_payout',
         matchId,
-        toWallet: player.walletAddress,
-        amount: '0', // TODO: Calculate remaining pot
+        toWallet: currentPlayer.walletAddress,
+        amount: winnerPrize.toFixed(4),
       });
+
+      // Record in Leaderboard service
+      if (this.leaderboardService) {
+        await this.leaderboardService.recordWin(
+          currentPlayer.walletAddress,
+          winnerPrize,
+        );
+      }
+
+      // Cleanup voice room
+      if (this.voiceService) {
+        this.voiceService.cleanupMatchRoom(matchId);
+      }
+    } else {
+      // Advance turn to next player
+      match.currentTurnIndex = this.ludoEngine.getNextTurn(match.currentTurnIndex);
+      match.turnDeadline = Date.now() + TURN_TIMEOUT_SECONDS * 1000;
     }
 
-    // Advance turn
-    match.currentTurnIndex = this.ludoEngine.getNextTurn(
-      match.currentTurnIndex,
-    );
-    match.turnDeadline = Date.now() + TURN_TIMEOUT_SECONDS * 1000;
-
     this.matchmakingService.updateMatch(matchId, match);
-
-    return { match, captured: capturedPlayer || undefined, isWinner };
+    return {
+      match,
+      captured: capturedPlayer,
+      isWinner: moveResult.isWinner,
+    };
   }
 
   /**
@@ -183,15 +234,14 @@ export class MatchService {
     player.timeoutStrikes++;
 
     if (player.timeoutStrikes >= MAX_TIMEOUT_STRIKES) {
-      // Convert to AI
       this.aiPlayerService.convertToAI(player);
       this.logger.log(`AI takeover for ${playerColor} in match ${matchId}`);
     }
 
-    // Advance turn
-    match.currentTurnIndex = this.ludoEngine.getNextTurn(
-      match.currentTurnIndex,
-    );
+    // Reset turn dice state and rotate turn
+    match.hasRolled = false;
+    match.currentDiceRoll = null;
+    match.currentTurnIndex = this.ludoEngine.getNextTurn(match.currentTurnIndex);
     match.turnDeadline = Date.now() + TURN_TIMEOUT_SECONDS * 1000;
 
     this.matchmakingService.updateMatch(matchId, match);
@@ -221,7 +271,7 @@ export class MatchService {
   }
 
   /**
-   * End a match and clean up.
+   * End a match and clean up voice and session resources.
    */
   async endMatch(matchId: string): Promise<void> {
     const match = this.matchmakingService.getMatch(matchId);
@@ -231,6 +281,11 @@ export class MatchService {
     match.finishedAt = Date.now();
     this.matchmakingService.updateMatch(matchId, match);
 
-    this.logger.log(`Match ${matchId} ended`);
+    if (this.voiceService) {
+      this.voiceService.cleanupMatchRoom(matchId);
+    }
+
+    this.logger.log(`Match ${matchId} ended and cleaned up`);
   }
 }
+

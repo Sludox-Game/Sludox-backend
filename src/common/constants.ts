@@ -29,6 +29,18 @@ export const MAX_TIMEOUT_STRIKES = 2;
 /** Session key expiry in minutes */
 export const SESSION_KEY_EXPIRY_MINUTES = 60;
 
+/** Safe squares on the board (cannot be captured here) */
+export const SAFE_SQUARES: readonly number[] = [0, 8, 13, 21, 26, 34, 39, 47];
+
+/** Starting position for finish column / home stretch */
+export const HOME_STRETCH_START = 52;
+
+/** Final destination square (Goal) */
+export const GOAL_POSITION = 57;
+
+/** Matchmaking queue timeout before spawning AI bots (30 seconds) */
+export const MATCHMAKING_TIMEOUT_MS = 30_000;
+
 /** BullMQ queue names */
 export const QUEUES = {
   TRANSACTION: 'transaction-queue',
@@ -41,6 +53,7 @@ export const REDIS_KEYS = {
   TURN_TIMER: 'turn:timer:',
   MATCHMAKING_QUEUE: 'matchmaking:queue',
   SESSION: 'session:',
+  LEADERBOARD: 'leaderboard:',
 } as const;
 
 /** Socket event names */
@@ -67,3 +80,4 @@ export const SOCKET_EVENTS = {
   CHAT_MESSAGE: 'chat:message',
   ERROR: 'error',
 } as const;
+
